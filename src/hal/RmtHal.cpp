@@ -23,43 +23,87 @@ namespace esp32irpk::hal
   namespace
   {
     constexpr const char *kTag = "ESP32IRPulseKit";
-    // RMT resolution: 100kHz (1 tick = 10us). Clock source is selected per SoC.
-    constexpr uint32_t kRmtResolutionHz = 100000; // 1 tick = 10us (RMT resolution)
-    // Fine resolution for the phase-aligned carrier path: 1MHz (1 tick = 1us),
-    // so a carrier half-cycle (~13us at 38kHz) is representable as RMT symbols.
-    constexpr uint32_t kRmtResolutionHzFine = 1000000; // 1 tick = 1us
+
+    // =====================================================================
+    // ESP32-S3 RMT rules (ESP-IDF 5.x)
+    // ---------------------------------------------------------------------
+    // 1. Group clock is SHARED by all channels in the group. First channel
+    //    locks the group resolution; later channels must match or fail with
+    //    "channel prescale out of the range".
+    // 2. Channel divider must be in [1, 256]. APB 80 MHz / 100 kHz = 800 → FAIL.
+    //    APB 80 MHz / 1 MHz = 80 → OK.  XTAL 40 MHz / 1 MHz = 40 → OK.
+    // 3. Duration field is 15-bit (0x7FFF). At 1 MHz max pulse = 32.767 ms.
+    //    signal_range_max_ns must stay under that limit.
+    // 4. Memory block size: 48 symbols on S3 (64 on classic). Request multiples.
+    // 5. Library external tick unit is always 10 µs (kRmtTickUs). On S3 the HW
+    //    runs at 1 µs; convert on the way in/out.
+    // =====================================================================
+
+    constexpr bool kIsEsp32S3 =
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(BOARD_ESP32_S3)
+        true;
+#else
+        false;
+#endif
+
+    // Public library tick (IRRawTickView): always 10 µs.
     constexpr uint32_t kRmtTickUs = 10;
+    constexpr uint32_t kTickUs = 10;
+
+    // Classic path: 100 kHz HW → 1 HW tick = 10 µs = 1 library tick.
+    constexpr uint32_t kRmtResolutionHzClassic = 100000;
+    // Fine / S3 path: 1 MHz HW → 1 HW tick = 1 µs; 10 HW ticks = 1 library tick.
+    constexpr uint32_t kRmtResolutionHzFine = 1000000;
+
+    // Unified channel resolution for this SoC (TX phase-aligned always uses Fine).
+    // S3: everything at 1 MHz so group lock is consistent.
+    // Classic: RX at 100 kHz; phase-aligned TX at 1 MHz (different groups on classic
+    //          are less strict; REF_TICK supports 100 kHz cleanly).
+    constexpr uint32_t kRmtResolutionHzRx =
+        kIsEsp32S3 ? kRmtResolutionHzFine : kRmtResolutionHzClassic;
+    constexpr uint32_t kRxHwTickUs = kIsEsp32S3 ? 1u : 10u;
+    // Scale library-tick → HW duration for non-phase TX on S3 (×10).
+    constexpr uint32_t kLibToHwScale = kIsEsp32S3 ? 10u : 1u;
+
+    // Legacy alias used by phase-aligned TX selection.
+    constexpr uint32_t kRmtResolutionHz = kRmtResolutionHzClassic;
+
     constexpr uint32_t kDefaultCarrierFrequencyHz = 38000;
-    constexpr size_t kMaxRxSymbols = 256;
-    // PATCH: classic ESP32 has no RMT RX ping-pong (SOC_RMT_SUPPORT_RX_PINGPONG),
-    // so a frame must fit entirely in the channel's hardware memory. The stock
-    // library hard-coded ONE block (64 symbols = 128 durations), which cuts any
-    // long frame (AC remotes). Allocate several blocks instead.
+    // Cap RX symbols to a multiple of the SoC block size (48 S3 / 64 classic).
+    constexpr size_t kMaxRxSymbols = kIsEsp32S3 ? 192u : 256u; // 4 blocks
     constexpr size_t kMaxRxBlocks = 4;
     constexpr size_t kMaxQueuedFrames = 4;
-    constexpr uint32_t kTickUs = 10; // library tick = 10us
 
     rmt_clock_source_t selectRmtClkSrc()
     {
-#if defined(SOC_RMT_SUPPORT_REF_TICK) && SOC_RMT_SUPPORT_REF_TICK
-      ESP_LOGV(kTag, "selectRmtClkSrc : RMT_CLK_SRC_REF_TICK");
+      // S3: always DEFAULT (APB/XTAL). REF_TICK is unreliable / unsupported
+      // for the resolutions we need on many Arduino-ESP32 builds.
+      // Classic: prefer REF_TICK (1 MHz) so 100 kHz channel div = 10.
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(BOARD_ESP32_S3)
+      return RMT_CLK_SRC_DEFAULT;
+#elif defined(SOC_RMT_SUPPORT_REF_TICK) && SOC_RMT_SUPPORT_REF_TICK
       return RMT_CLK_SRC_REF_TICK;
 #else
-      ESP_LOGV(kTag, "selectRmtClkSrc : RMT_CLK_SRC_DEFAULT");
       return RMT_CLK_SRC_DEFAULT;
 #endif
     }
 
+    // Hard ceiling for signal_range_max_ns at the active RX resolution.
+    constexpr uint32_t kRxMaxIdleNs = 0x7FFFu * kRxHwTickUs * 1000u;
+
     std::vector<rmt_symbol_word_t> toSymbols(const esp32irpk::IRRawTickView &raw, bool mark_high)
     {
-      constexpr uint16_t kMaxDuration = 0x7FFF; // RMT duration field limit
+      // raw.ticks are library 10 µs units. HW channel may be 1 µs (S3) or 10 µs.
+      constexpr uint16_t kMaxDuration = 0x7FFF;
       std::vector<rmt_symbol_word_t> syms;
       syms.reserve((raw.len + 1) / 2);
       for (size_t i = 0; i < raw.len; i += 2)
       {
         rmt_symbol_word_t s{};
-        uint32_t mark_ticks = raw.ticks[i];
-        uint32_t space_ticks = (i + 1 < raw.len) ? static_cast<uint32_t>(raw.ticks[i + 1]) : 0;
+        uint32_t mark_ticks = static_cast<uint32_t>(raw.ticks[i]) * kLibToHwScale;
+        uint32_t space_ticks = (i + 1 < raw.len)
+            ? static_cast<uint32_t>(raw.ticks[i + 1]) * kLibToHwScale
+            : 0;
         if (mark_ticks > kMaxDuration)
           mark_ticks = kMaxDuration;
         if (space_ticks > kMaxDuration)
@@ -203,7 +247,7 @@ namespace esp32irpk::hal
     cfg.clk_src = selectRmtClkSrc();
     cfg.gpio_num = static_cast<gpio_num_t>(gpio_);
     cfg.mem_block_symbols = mem_words;
-    cfg.resolution_hz = phase_aligned ? kRmtResolutionHzFine : kRmtResolutionHz;
+    cfg.resolution_hz = phase_aligned ? kRmtResolutionHzFine : kRmtResolutionHzRx;
     cfg.trans_queue_depth = 2;
     cfg.flags.invert_out = inverted_;
 
@@ -348,18 +392,21 @@ namespace esp32irpk::hal
       return false;
     gpio_ = gpio;
     inverted_ = inverted;
-    // A single space/idle is a 15-bit duration field at the RX resolution
-    // (1 tick = kRmtTickUs). Clamp so signal_range_max_ns stays representable.
-    constexpr uint32_t kMaxIdleUs = 0x7FFFu * kRmtTickUs;
+    // A single space/idle is a 15-bit duration field at the *hardware* resolution.
+    // Classic 100 kHz → 1 tick = 10 µs → max ~327 ms.
+    // S3     1 MHz   → 1 tick = 1 µs  → max ~32.7 ms (IDF rejects larger signal_range_max_ns).
+    constexpr uint32_t kMaxIdleUs = 0x7FFFu * kRxHwTickUs;
     idle_threshold_us_ = idle_threshold_us > kMaxIdleUs ? kMaxIdleUs : idle_threshold_us;
+    if (idle_threshold_us_ < 1000)
+      idle_threshold_us_ = 1000; // at least 1 ms
     max_rx_symbols_ = max_rx_symbols ? max_rx_symbols : kMaxRxSymbols;
-    ESP_LOGV(kTag, "RMT RX begin: gpio=%d inverted=%d idle_threshold_us=%u tick_us=%u max_rx_symbols=%u",
-             gpio_, inverted_ ? 1 : 0, idle_threshold_us_, kRmtTickUs, (unsigned)max_rx_symbols_);
+    ESP_LOGV(kTag, "RMT RX begin: gpio=%d inverted=%d idle_threshold_us=%u hw_tick_us=%u max_rx_symbols=%u",
+             gpio_, inverted_ ? 1 : 0, idle_threshold_us_, kRxHwTickUs, (unsigned)max_rx_symbols_);
 
     rmt_rx_channel_config_t cfg = {};
     cfg.clk_src = selectRmtClkSrc();
     cfg.gpio_num = static_cast<gpio_num_t>(gpio_);
-    cfg.resolution_hz = kRmtResolutionHz;
+    cfg.resolution_hz = kRmtResolutionHzRx;  // S3: 1 MHz (match TX group); classic: 100 kHz
     cfg.flags.invert_in = inverted_;
     cfg.flags.with_dma = false;
 
@@ -501,18 +548,30 @@ namespace esp32irpk::hal
 
       auto *sym = reinterpret_cast<const rmt_symbol_word_t *>(sym_buf_.data());
       frame.ticks.reserve(sym_count_ * 2);
+      // Convert HW duration units → library 10 µs ticks.
+      // Classic: resolution 100 kHz → 1 HW tick = 10 µs (scale 1).
+      // S3:      resolution 1 MHz   → 1 HW tick = 1 µs  (scale /10).
+      constexpr uint32_t kScale = kRmtTickUs / kRxHwTickUs; // 1 or 10
       for (size_t i = 0; i < sym_count_; ++i)
       {
         const auto &s = sym[i];
         uint32_t t0 = static_cast<uint32_t>(s.duration0);
+        if (kScale > 1)
+          t0 = (t0 + kScale / 2) / kScale; // round to nearest 10 µs tick
         if (t0 > 0xFFFF)
           t0 = 0xFFFF;
+        if (t0 == 0 && s.duration0 > 0)
+          t0 = 1; // preserve non-zero pulse
         frame.ticks.push_back(static_cast<uint16_t>(t0));
         if (s.duration1 > 0)
         {
           uint32_t t1 = static_cast<uint32_t>(s.duration1);
+          if (kScale > 1)
+            t1 = (t1 + kScale / 2) / kScale;
           if (t1 > 0xFFFF)
             t1 = 0xFFFF;
+          if (t1 == 0)
+            t1 = 1;
           frame.ticks.push_back(static_cast<uint16_t>(t1));
         }
       }
@@ -596,7 +655,13 @@ namespace esp32irpk::hal
     }
     rmt_receive_config_t rcfg = {};
     rcfg.signal_range_min_ns = 0;
-    rcfg.signal_range_max_ns = idle_threshold_us_ * 1000;
+    // IDF rejects signal_range_max_ns >= 0x7FFF * hw_tick_us * 1000.
+    uint32_t max_ns = idle_threshold_us_ * 1000u;
+    if (max_ns > kRxMaxIdleNs)
+      max_ns = kRxMaxIdleNs;
+    if (max_ns < 1000u)
+      max_ns = 1000u;
+    rcfg.signal_range_max_ns = max_ns;
 
     esp_err_t err = rmt_receive(reinterpret_cast<rmt_channel_handle_t>(rx_channel_),
                                 sym_buf_.data(),
